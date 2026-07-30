@@ -1,97 +1,60 @@
-import re
-import requests
-import pandas as pd
 import streamlit as st
-import plotly.express as px
+import pandas as pd
+import requests
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="전국 고령화 지도", layout="wide")
-st.title("🗺️ 전국 고령화 지도")
-st.caption("시군구별 65세 이상 인구 비율 (행정안전부 주민등록 인구)")
+st.set_page_config(page_title="박스오피스 대시보드", layout="wide")
+st.title("🎬 어제의 박스오피스")
 
-POP_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
-GEO_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
+# 비밀 금고에서 인증키 꺼내기 (코드에는 키를 적지 않는다)
+KOBIS_KEY = st.secrets["KOBIS_KEY"]
 
+# 한국 시간 기준 어제 날짜를 여덟 자리로 (배포 서버 시계는 외국 기준일 수 있다)
+yesterday = datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=1)
+target_dt = yesterday.strftime("%Y%m%d")
+st.caption(f"조회 기준일(어제): {yesterday.strftime('%Y-%m-%d')}")
 
-@st.cache_data(show_spinner="인구 데이터를 불러오는 중입니다...")
-def load_population():
-    return pd.read_csv(POP_URL, dtype={"코드": str})
+url = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/searchDailyBoxOfficeList.json"
+res = requests.get(url, params={"key": KOBIS_KEY, "targetDt": target_dt}, timeout=10)
 
+if res.status_code != 200:
+    st.error(f"요청이 실패했습니다 (상태코드: {res.status_code})")
+    st.stop()
 
-@st.cache_data(show_spinner="지도 경계를 불러오는 중입니다...")
-def load_geojson():
-    return requests.get(GEO_URL, timeout=30).json()
+data = res.json()
 
+# KOBIS는 키가 틀려도 상태코드 200을 준다. 대신 faultInfo 상자가 온다.
+if "faultInfo" in data:
+    st.error("인증키가 올바르지 않습니다. 금고(Secrets)의 KOBIS_KEY를 확인해 주세요.")
+    st.stop()
 
-df = load_population()
-geojson = load_geojson()
+box_list = data.get("boxOfficeResult", {}).get("dailyBoxOfficeList", [])
+if not box_list:
+    st.warning("그날 자료가 없습니다. 날짜를 하루 더 앞으로 옮겨 보세요.")
+    st.stop()
 
-latest_year = int(df["연도"].max())
-df = df[df["연도"] == latest_year].copy()
+df = pd.DataFrame(box_list)
 
-total_cols = [c for c in df.columns if c.startswith("계_")]
+# 글자로 온 숫자들을 진짜 숫자로 바꾸기
+for col in ["rank", "audiCnt", "audiAcc", "scrnCnt", "showCnt"]:
+    df[col] = pd.to_numeric(df[col])
 
+# 1위 영화 지표 카드 세 장
+top = df.sort_values("rank").iloc[0]
+c1, c2, c3 = st.columns(3)
+c1.metric("어제 1위", top["movieNm"])
+c2.metric("어제 관객수", f"{top['audiCnt']:,}명")
+c3.metric("누적 관객", f"{top['audiAcc']:,}명")
 
-def age_of(col):
-    m = re.match(r"계_(\d+)세", col)
-    return int(m.group(1)) if m else None
+# 표를 한국어 열 이름으로 정리
+table = df[["rank", "movieNm", "openDt", "audiCnt", "audiAcc", "scrnCnt"]].copy()
+table.columns = ["순위", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]
+table = table.sort_values("순위").reset_index(drop=True)
 
+st.subheader("📋 박스오피스 TOP 10")
+st.dataframe(table)
 
-elderly_cols = [c for c in total_cols if age_of(c) is not None and age_of(c) >= 65]
-
-df["전체인구"] = df[total_cols].sum(axis=1)
-df["고령인구"] = df[elderly_cols].sum(axis=1)
-
-df["시군구코드"] = df["코드"].str[:5]
-grouped = df.groupby("시군구코드")[["전체인구", "고령인구"]].sum().reset_index()
-grouped["고령화율"] = (grouped["고령인구"] / grouped["전체인구"] * 100).round(2)
-
-names = pd.DataFrame([
-    {
-        "시군구코드": str(f["properties"]["코드"]),
-        "시군구": f["properties"]["시군구"],
-        "시도": f["properties"]["시도"],
-    }
-    for f in geojson["features"]
-])
-merged = grouped.merge(names, on="시군구코드", how="left")
-
-BINS = [0, 19, 23, 28, 38, 100]
-LABELS = ["19% 미만", "19~23%", "23~28%", "28~38%", "38% 이상"]
-COLORS = {
-    "19% 미만": "#fee6ce",
-    "19~23%": "#fdc086",
-    "23~28%": "#f79646",
-    "28~38%": "#e8590c",
-    "38% 이상": "#a63603",
-}
-merged["단계"] = pd.cut(merged["고령화율"], bins=BINS, labels=LABELS, right=False)
-
-fig = px.choropleth(
-    merged,
-    geojson=geojson,
-    locations="시군구코드",
-    featureidkey="properties.코드",
-    color="단계",
-    category_orders={"단계": LABELS},
-    color_discrete_map=COLORS,
-    hover_name="시군구",
-    hover_data={"고령화율": True, "시도": True, "시군구코드": False, "단계": False},
-    labels={"고령화율": "65세 이상 비율(%)"},
-)
-fig.update_geos(fitbounds="locations", visible=False)
-fig.update_layout(
-    margin=dict(l=0, r=0, t=10, b=0),
-    height=700,
-    legend_title_text=f"65세 이상 비율 ({latest_year}년)",
-)
-
-st.plotly_chart(fig, width="stretch")
-
-c1, c2 = st.columns(2)
-cols = ["시도", "시군구", "고령화율"]
-with c1:
-    st.subheader("🔴 고령화율 높은 곳 10")
-    st.dataframe(merged.nlargest(10, "고령화율")[cols].reset_index(drop=True))
-with c2:
-    st.subheader("🟢 고령화율 낮은 곳 10")
-    st.dataframe(merged.nsmallest(10, "고령화율")[cols].reset_index(drop=True))
+st.subheader("📈 관객수 상위 5편")
+top5 = table.sort_values("관객수", ascending=False).head(5)
+st.bar_chart(top5.set_index("영화명")["관객수"])
